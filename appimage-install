@@ -214,6 +214,14 @@ do_install() {
         exit 1
     fi
 
+    # Fix AppRun: force APPDIR instead of conditionally setting it
+    # Without this, inherited APPDIR from other AppImages breaks launches
+    local apprun="${tmpdir}/squashfs-root/AppRun"
+    if [[ -f "$apprun" ]] && grep -q 'if \[ -z "$APPDIR" \]' "$apprun" 2>/dev/null; then
+        sed -i '/if \[ -z "$APPDIR" \]/,/^fi$/c\APPDIR="$(dirname "$(readlink -f "${THIS}")")"' "$apprun"
+        ok "Patched AppRun (fixed APPDIR detection)"
+    fi
+
     # Detect app metadata
     local app_name
     if [[ -n "$custom_name" ]]; then
@@ -280,8 +288,8 @@ do_install() {
         warn "No icon found"
     fi
 
-    # Build Exec line
-    local exec_line="${install_path}/AppRun"
+    # Build Exec line — env -u clears stale vars from other AppImages
+    local exec_line="env -u APPDIR -u ELECTRON_RUN_AS_NODE -u DESKTOPINTEGRATION ${install_path}/AppRun"
     if [[ "$no_sandbox" == true ]]; then
         exec_line="${exec_line} --no-sandbox"
     fi
