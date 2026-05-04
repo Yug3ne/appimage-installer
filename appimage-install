@@ -1,0 +1,397 @@
+#!/usr/bin/env bash
+# appimage-install — Extract AppImages for faster, lighter execution
+# No FUSE, no tmpfs RAM usage, proper desktop integration with icons
+#
+# Usage:
+#   appimage-install <file.AppImage>              # Install with auto-detected name
+#   appimage-install <file.AppImage> --name myapp # Install with custom name
+#   appimage-install --list                       # List installed apps
+#   appimage-install --remove <name>              # Remove an installed app
+#   appimage-install --help                       # Show help
+
+set -euo pipefail
+
+INSTALL_DIR="${HOME}/.local/opt"
+DESKTOP_DIR="${HOME}/.local/share/applications"
+BIN_DIR="${HOME}/.local/bin"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+info()  { echo -e "${BLUE}::${NC} $*"; }
+ok()    { echo -e "${GREEN}✓${NC} $*"; }
+warn()  { echo -e "${YELLOW}!${NC} $*"; }
+error() { echo -e "${RED}✗${NC} $*" >&2; }
+
+usage() {
+    cat <<'EOF'
+appimage-install — Extract & install AppImages without FUSE overhead
+
+USAGE:
+    appimage-install <file.AppImage>              Install with auto-detected name
+    appimage-install <file.AppImage> --name myapp Install with custom name
+    appimage-install --list                       List installed apps
+    appimage-install --remove <name>              Remove an installed app
+
+OPTIONS:
+    --name <name>    Override the app name (used for folder and command name)
+    --no-sandbox     Add --no-sandbox flag to Exec (needed for Electron apps)
+    --help           Show this help
+
+EXAMPLES:
+    appimage-install ~/Downloads/Obsidian-1.5.AppImage
+    appimage-install MyApp.AppImage --name myapp
+    appimage-install --remove myapp
+    appimage-install --list
+
+WHAT IT DOES:
+    1. Extracts the AppImage (no more FUSE/tmpfs RAM usage)
+    2. Moves it to ~/.local/opt/<name>/
+    3. Finds the icon and creates a .desktop entry
+    4. Creates a symlink in ~/.local/bin/ for terminal launch
+    5. Removes the original .AppImage file
+
+EOF
+    exit 0
+}
+
+find_icon() {
+    local app_dir="$1"
+    local icon=""
+
+    # Look for the largest PNG icon in hicolor
+    icon=$(find "${app_dir}/usr/share/icons" -name "*.png" 2>/dev/null \
+        | sort -t/ -k8 -rn \
+        | head -1)
+
+    # Fallback: any .png in the root of the extracted dir
+    if [[ -z "$icon" ]]; then
+        icon=$(find "${app_dir}" -maxdepth 1 -name "*.png" 2>/dev/null | head -1)
+    fi
+
+    # Fallback: any .svg
+    if [[ -z "$icon" ]]; then
+        icon=$(find "${app_dir}" -name "*.svg" 2>/dev/null | head -1)
+    fi
+
+    echo "$icon"
+}
+
+find_desktop_file() {
+    local app_dir="$1"
+    find "${app_dir}" -maxdepth 1 -name "*.desktop" 2>/dev/null | head -1
+}
+
+detect_name() {
+    local app_dir="$1"
+    local desktop_file
+    desktop_file=$(find_desktop_file "$app_dir")
+
+    if [[ -n "$desktop_file" ]]; then
+        # Try to get StartupWMClass or Name from the embedded .desktop
+        local wm_class
+        wm_class=$(grep -i "^StartupWMClass=" "$desktop_file" 2>/dev/null | cut -d= -f2 | tr '[:upper:]' '[:lower:]' | tr ' ' '-')
+        if [[ -n "$wm_class" ]]; then
+            echo "$wm_class"
+            return
+        fi
+    fi
+
+    # Fallback: derive from AppImage filename
+    local basename
+    basename=$(basename "$APPIMAGE_PATH" .AppImage)
+    basename=$(echo "$basename" | sed -E 's/-[0-9]+\..*//' | sed 's/_x86_64//' | sed 's/_aarch64//' | tr '[:upper:]' '[:lower:]' | tr ' _' '-')
+    echo "$basename"
+}
+
+detect_display_name() {
+    local app_dir="$1"
+    local desktop_file
+    desktop_file=$(find_desktop_file "$app_dir")
+
+    if [[ -n "$desktop_file" ]]; then
+        local name
+        name=$(grep -i "^Name=" "$desktop_file" 2>/dev/null | head -1 | cut -d= -f2)
+        if [[ -n "$name" ]]; then
+            echo "$name"
+            return
+        fi
+    fi
+
+    basename "$APPIMAGE_PATH" .AppImage | sed -E 's/-[0-9]+\..*//'
+}
+
+detect_categories() {
+    local app_dir="$1"
+    local desktop_file
+    desktop_file=$(find_desktop_file "$app_dir")
+
+    if [[ -n "$desktop_file" ]]; then
+        local cats
+        cats=$(grep -i "^Categories=" "$desktop_file" 2>/dev/null | cut -d= -f2)
+        if [[ -n "$cats" ]]; then
+            echo "$cats"
+            return
+        fi
+    fi
+
+    echo "Utility;"
+}
+
+detect_wm_class() {
+    local app_dir="$1"
+    local desktop_file
+    desktop_file=$(find_desktop_file "$app_dir")
+
+    if [[ -n "$desktop_file" ]]; then
+        grep -i "^StartupWMClass=" "$desktop_file" 2>/dev/null | cut -d= -f2
+    fi
+}
+
+detect_mimetype() {
+    local app_dir="$1"
+    local desktop_file
+    desktop_file=$(find_desktop_file "$app_dir")
+
+    if [[ -n "$desktop_file" ]]; then
+        grep -i "^MimeType=" "$desktop_file" 2>/dev/null | cut -d= -f2
+    fi
+}
+
+do_install() {
+    local appimage="$1"
+    shift
+
+    local custom_name=""
+    local no_sandbox=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --name)
+                custom_name="$2"
+                shift 2
+                ;;
+            --no-sandbox)
+                no_sandbox=true
+                shift
+                ;;
+            *)
+                error "Unknown option: $1"
+                exit 1
+                ;;
+        esac
+    done
+
+    # Resolve to absolute path
+    APPIMAGE_PATH="$(realpath "$appimage")"
+
+    if [[ ! -f "$APPIMAGE_PATH" ]]; then
+        error "File not found: $appimage"
+        exit 1
+    fi
+
+    if [[ ! "$APPIMAGE_PATH" == *.AppImage ]] && [[ ! "$APPIMAGE_PATH" == *.appimage ]]; then
+        error "Not an AppImage file: $appimage"
+        exit 1
+    fi
+
+    if [[ ! -x "$APPIMAGE_PATH" ]]; then
+        chmod +x "$APPIMAGE_PATH"
+    fi
+
+    # Extract
+    info "Extracting AppImage..."
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    (cd "$tmpdir" && "$APPIMAGE_PATH" --appimage-extract > /dev/null 2>&1)
+
+    if [[ ! -d "${tmpdir}/squashfs-root" ]]; then
+        error "Extraction failed"
+        rm -rf "$tmpdir"
+        exit 1
+    fi
+
+    # Detect app metadata
+    local app_name
+    if [[ -n "$custom_name" ]]; then
+        app_name="$custom_name"
+    else
+        app_name=$(detect_name "${tmpdir}/squashfs-root")
+    fi
+
+    local display_name
+    display_name=$(detect_display_name "${tmpdir}/squashfs-root")
+    local categories
+    categories=$(detect_categories "${tmpdir}/squashfs-root")
+    local wm_class
+    wm_class=$(detect_wm_class "${tmpdir}/squashfs-root")
+    local mimetype
+    mimetype=$(detect_mimetype "${tmpdir}/squashfs-root")
+    local icon_path
+    icon_path=$(find_icon "${tmpdir}/squashfs-root")
+
+    info "App name:     ${app_name}"
+    info "Display name: ${display_name}"
+
+    # Check for existing installation
+    local install_path="${INSTALL_DIR}/${app_name}"
+    if [[ -d "$install_path" ]]; then
+        warn "Existing installation found at ${install_path}"
+        warn "Replacing with new version..."
+        rm -rf "$install_path"
+    fi
+
+    # Move to install directory
+    mkdir -p "$INSTALL_DIR"
+    mv "${tmpdir}/squashfs-root" "$install_path"
+    rm -rf "$tmpdir"
+    ok "Extracted to ${install_path}"
+
+    # Resolve icon (now relative to install path)
+    if [[ -n "$icon_path" ]]; then
+        icon_path="${install_path}/${icon_path#${install_path}/}"
+        # If it was a relative path from squashfs-root, fix it
+        icon_path=$(echo "$icon_path" | sed "s|.*/squashfs-root/|${install_path}/|")
+        # Resolve symlinks to get a real file
+        if [[ -L "$icon_path" ]]; then
+            local resolved
+            resolved=$(readlink -f "$icon_path" 2>/dev/null)
+            if [[ -f "$resolved" ]]; then
+                icon_path="$resolved"
+            fi
+        fi
+    fi
+
+    # Find the icon again from the installed location
+    icon_path=$(find_icon "$install_path")
+    if [[ -z "$icon_path" ]]; then
+        # check root-level png
+        icon_path=$(find "${install_path}" -maxdepth 1 -name "*.png" 2>/dev/null | head -1)
+    fi
+
+    if [[ -n "$icon_path" ]]; then
+        # Resolve symlinks
+        icon_path=$(readlink -f "$icon_path" 2>/dev/null || echo "$icon_path")
+        ok "Icon: ${icon_path}"
+    else
+        warn "No icon found"
+    fi
+
+    # Build Exec line
+    local exec_line="${install_path}/AppRun"
+    if [[ "$no_sandbox" == true ]]; then
+        exec_line="${exec_line} --no-sandbox"
+    fi
+    exec_line="${exec_line} %U"
+
+    # Create desktop entry
+    mkdir -p "$DESKTOP_DIR"
+    local desktop_file="${DESKTOP_DIR}/${app_name}.desktop"
+
+    {
+        echo "[Desktop Entry]"
+        echo "Name=${display_name}"
+        echo "Exec=${exec_line}"
+        echo "Terminal=false"
+        echo "Type=Application"
+        [[ -n "$icon_path" ]] && echo "Icon=${icon_path}"
+        [[ -n "$wm_class" ]] && echo "StartupWMClass=${wm_class}"
+        [[ -n "$mimetype" ]] && echo "MimeType=${mimetype}"
+        echo "Categories=${categories}"
+        echo "X-InstalledBy=appimage-install"
+    } > "$desktop_file"
+
+    ok "Desktop entry: ${desktop_file}"
+
+    # Create bin symlink
+    mkdir -p "$BIN_DIR"
+    ln -sf "${install_path}/AppRun" "${BIN_DIR}/${app_name}"
+    ok "Command: ${app_name} (in ~/.local/bin/)"
+
+    # Update desktop database
+    update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
+
+    # Remove original AppImage
+    info "Removing original AppImage..."
+    rm -f "$APPIMAGE_PATH"
+    ok "Removed ${APPIMAGE_PATH}"
+
+    echo ""
+    ok "Installed ${display_name} successfully!"
+    echo ""
+    echo "  Launch from menu or run: ${app_name}"
+    echo "  Install dir: ${install_path}"
+    echo "  Remove with: appimage-install --remove ${app_name}"
+}
+
+do_list() {
+    info "Installed AppImages:"
+    echo ""
+
+    local found=false
+    for desktop_file in "${DESKTOP_DIR}"/*.desktop; do
+        [[ -f "$desktop_file" ]] || continue
+        if grep -q "X-InstalledBy=appimage-install" "$desktop_file" 2>/dev/null; then
+            local name dir size
+            name=$(grep "^Name=" "$desktop_file" | cut -d= -f2)
+            app_name=$(basename "$desktop_file" .desktop)
+            dir="${INSTALL_DIR}/${app_name}"
+            size=$(du -sh "$dir" 2>/dev/null | cut -f1 || echo "?")
+            echo -e "  ${GREEN}${app_name}${NC}  ${name}  (${size})"
+            found=true
+        fi
+    done
+
+    if [[ "$found" == false ]]; then
+        echo "  No apps installed with appimage-install yet."
+        echo "  (Previously extracted apps won't show here — only new installs.)"
+    fi
+}
+
+do_remove() {
+    local app_name="$1"
+
+    if [[ -z "$app_name" ]]; then
+        error "Usage: appimage-install --remove <name>"
+        exit 1
+    fi
+
+    local install_path="${INSTALL_DIR}/${app_name}"
+    local desktop_file="${DESKTOP_DIR}/${app_name}.desktop"
+    local bin_link="${BIN_DIR}/${app_name}"
+
+    if [[ ! -d "$install_path" ]] && [[ ! -f "$desktop_file" ]]; then
+        error "App '${app_name}' not found"
+        echo "Run 'appimage-install --list' to see installed apps"
+        exit 1
+    fi
+
+    info "Removing ${app_name}..."
+
+    [[ -d "$install_path" ]] && rm -rf "$install_path" && ok "Removed ${install_path}"
+    [[ -f "$desktop_file" ]] && rm -f "$desktop_file" && ok "Removed ${desktop_file}"
+    [[ -L "$bin_link" ]] && rm -f "$bin_link" && ok "Removed ${bin_link}"
+
+    update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
+
+    ok "Uninstalled ${app_name}"
+}
+
+# Main
+case "${1:-}" in
+    --help|-h|"")
+        usage
+        ;;
+    --list|-l)
+        do_list
+        ;;
+    --remove|-r)
+        do_remove "${2:-}"
+        ;;
+    *)
+        do_install "$@"
+        ;;
+esac
