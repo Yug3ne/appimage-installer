@@ -5,11 +5,12 @@
 # Usage:
 #   appimage-install <file.AppImage>              # Install with auto-detected name
 #   appimage-install <file.AppImage> --name myapp # Install with custom name
+#   appimage-install --update <name>              # Update an installed app
 #   appimage-install --list                       # List installed apps
 #   appimage-install --remove <name>              # Remove an installed app
 #   appimage-install --help                       # Show help
 
-set -euo pipefail
+set -uo pipefail
 
 INSTALL_DIR="${HOME}/.local/opt"
 DESKTOP_DIR="${HOME}/.local/share/applications"
@@ -33,6 +34,8 @@ appimage-install — Extract & install AppImages without FUSE overhead
 USAGE:
     appimage-install <file.AppImage>              Install with auto-detected name
     appimage-install <file.AppImage> --name myapp Install with custom name
+    appimage-install --update <name>              Update an installed app from GitHub
+    appimage-install --update-all                 Update all installed apps
     appimage-install --list                       List installed apps
     appimage-install --remove <name>              Remove an installed app
 
@@ -42,8 +45,10 @@ OPTIONS:
     --help           Show this help
 
 EXAMPLES:
-    appimage-install ~/Downloads/Obsidian-1.5.AppImage
+    appimage-install ~/Downloads/MyApp.AppImage
     appimage-install MyApp.AppImage --name myapp
+    appimage-install --update t3code
+    appimage-install --update-all
     appimage-install --remove myapp
     appimage-install --list
 
@@ -53,6 +58,12 @@ WHAT IT DOES:
     3. Finds the icon and creates a .desktop entry
     4. Creates a symlink in ~/.local/bin/ for terminal launch
     5. Removes the original .AppImage file
+
+AUTO-UPDATE:
+    Apps installed from GitHub-released AppImages can be updated with --update.
+    The script reads app-update.yml from the installed app to find the GitHub
+    repo, checks for a newer release, downloads the new AppImage, and
+    re-extracts it — preserving your desktop entry and command.
 
 EOF
     exit 0
@@ -158,6 +169,278 @@ detect_mimetype() {
 
     if [[ -n "$desktop_file" ]]; then
         grep -i "^MimeType=" "$desktop_file" 2>/dev/null | cut -d= -f2
+    fi
+}
+
+get_update_info() {
+    local install_path="$1"
+    local yml=""
+
+    # Look for app-update.yml (electron-updater config)
+    yml=$(find "$install_path" -name "app-update.yml" -path "*/resources/*" 2>/dev/null | head -1)
+
+    if [[ -z "$yml" ]]; then
+        return 1
+    fi
+
+    echo "$yml"
+}
+
+get_current_version() {
+    local install_path="$1"
+
+    # Try embedded .desktop file inside the app (most reliable)
+    local embedded_desktop
+    embedded_desktop=$(find "$install_path" -maxdepth 1 -name "*.desktop" 2>/dev/null | head -1)
+    if [[ -n "$embedded_desktop" ]]; then
+        local ver
+        ver=$(grep "^X-AppImage-Version=" "$embedded_desktop" 2>/dev/null | cut -d= -f2)
+        if [[ -n "$ver" ]]; then
+            echo "$ver"
+            return
+        fi
+    fi
+
+    # Try our desktop entry
+    local desktop_file="${DESKTOP_DIR}/$(basename "$install_path").desktop"
+    if [[ -f "$desktop_file" ]]; then
+        local ver
+        ver=$(grep "^X-AppImage-Version=" "$desktop_file" 2>/dev/null | cut -d= -f2)
+        if [[ -n "$ver" ]]; then
+            echo "$ver"
+            return
+        fi
+    fi
+
+    echo "unknown"
+}
+
+do_update() {
+    local app_name="$1"
+
+    if [[ -z "$app_name" ]]; then
+        error "Usage: appimage-install --update <name>"
+        echo "Run 'appimage-install --list' to see installed apps"
+        exit 1
+    fi
+
+    local install_path="${INSTALL_DIR}/${app_name}"
+
+    if [[ ! -d "$install_path" ]]; then
+        error "App '${app_name}' not found at ${install_path}"
+        echo "Run 'appimage-install --list' to see installed apps"
+        exit 1
+    fi
+
+    # Get update info
+    local yml
+    yml=$(get_update_info "$install_path")
+    if [[ -z "$yml" ]]; then
+        error "No app-update.yml found — cannot determine update source"
+        echo "You can manually download the new AppImage and run:"
+        echo "  appimage-install new-version.AppImage --name ${app_name}"
+        exit 1
+    fi
+
+    # Parse GitHub owner/repo
+    local owner repo provider
+    owner=$(grep "^owner:" "$yml" | awk '{print $2}' | tr -d '[:space:]')
+    repo=$(grep "^repo:" "$yml" | awk '{print $2}' | tr -d '[:space:]')
+    provider=$(grep "^provider:" "$yml" | awk '{print $2}' | tr -d '[:space:]')
+
+    if [[ "$provider" != "github" ]]; then
+        error "Only GitHub provider is supported (found: ${provider})"
+        exit 1
+    fi
+
+    if [[ -z "$owner" || -z "$repo" ]]; then
+        error "Could not parse owner/repo from ${yml}"
+        exit 1
+    fi
+
+    info "Checking ${owner}/${repo} for updates..."
+
+    # Get current version
+    local current_version
+    current_version=$(get_current_version "$install_path")
+    info "Current version: ${current_version}"
+
+    # Get latest release from GitHub
+    local release_json
+    release_json=$(curl -sL "https://api.github.com/repos/${owner}/${repo}/releases/latest")
+
+    local latest_version
+    latest_version=$(echo "$release_json" | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4 | sed 's/^v//')
+
+    if [[ -z "$latest_version" ]]; then
+        error "Could not fetch latest release from GitHub"
+        echo "$release_json" | head -5
+        exit 1
+    fi
+
+    info "Latest version:  ${latest_version}"
+
+    if [[ "$current_version" == "$latest_version" ]]; then
+        ok "Already up to date!"
+        return 0
+    fi
+
+    # Find the AppImage download URL
+    local download_url
+    download_url=$(echo "$release_json" | grep -o '"browser_download_url"[[:space:]]*:[[:space:]]*"[^"]*\.AppImage"' | cut -d'"' -f4 | grep -i "x86_64\|amd64\|linux" | head -1)
+
+    # If no arch-specific match, try any AppImage
+    if [[ -z "$download_url" ]]; then
+        download_url=$(echo "$release_json" | grep -o '"browser_download_url"[[:space:]]*:[[:space:]]*"[^"]*\.AppImage"' | cut -d'"' -f4 | head -1)
+    fi
+
+    if [[ -z "$download_url" ]]; then
+        error "No AppImage found in the latest release"
+        echo "Check: https://github.com/${owner}/${repo}/releases/latest"
+        exit 1
+    fi
+
+    info "Downloading: $(basename "$download_url")"
+
+    # Download to temp
+    local tmpfile
+    tmpfile=$(mktemp --suffix=.AppImage)
+    if ! curl -L --progress-bar -o "$tmpfile" "$download_url"; then
+        error "Download failed"
+        rm -f "$tmpfile"
+        exit 1
+    fi
+
+    chmod +x "$tmpfile"
+    ok "Downloaded $(du -h "$tmpfile" | cut -f1)"
+
+    # Check if desktop entry has --no-sandbox
+    local no_sandbox_flag=""
+    local desktop_file="${DESKTOP_DIR}/${app_name}.desktop"
+    if [[ -f "$desktop_file" ]] && grep -q "\-\-no-sandbox" "$desktop_file"; then
+        no_sandbox_flag="--no-sandbox"
+    fi
+
+    # Re-install (do_install handles replacing existing)
+    APPIMAGE_PATH="$tmpfile"
+    info "Installing update..."
+
+    # Extract
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    (cd "$tmpdir" && "$tmpfile" --appimage-extract > /dev/null 2>&1)
+
+    if [[ ! -d "${tmpdir}/squashfs-root" ]]; then
+        error "Extraction failed"
+        rm -rf "$tmpdir" "$tmpfile"
+        exit 1
+    fi
+
+    # Patch AppRun
+    local apprun="${tmpdir}/squashfs-root/AppRun"
+    if [[ -f "$apprun" ]] && grep -q 'if \[ -z "$APPDIR" \]' "$apprun" 2>/dev/null; then
+        sed -i '/if \[ -z "$APPDIR" \]/,/^fi$/c\APPDIR="$(dirname "$(readlink -f "${THIS}")")"' "$apprun"
+    fi
+
+    # Replace installation
+    rm -rf "$install_path"
+    mv "${tmpdir}/squashfs-root" "$install_path"
+    rm -rf "$tmpdir" "$tmpfile"
+
+    # Update icon in desktop entry
+    local icon_path
+    icon_path=$(find_icon "$install_path")
+    if [[ -z "$icon_path" ]]; then
+        icon_path=$(find "${install_path}" -maxdepth 1 -name "*.png" 2>/dev/null | head -1)
+    fi
+    if [[ -n "$icon_path" ]]; then
+        icon_path=$(readlink -f "$icon_path" 2>/dev/null || echo "$icon_path")
+    fi
+
+    # Rebuild desktop entry (preserve settings)
+    local display_name wm_class mimetype categories
+    local app_desktop
+    app_desktop=$(find_desktop_file "$install_path")
+    if [[ -n "$app_desktop" ]]; then
+        display_name=$(grep -i "^Name=" "$app_desktop" 2>/dev/null | head -1 | cut -d= -f2)
+        wm_class=$(grep -i "^StartupWMClass=" "$app_desktop" 2>/dev/null | cut -d= -f2)
+        mimetype=$(grep -i "^MimeType=" "$app_desktop" 2>/dev/null | cut -d= -f2)
+        categories=$(grep -i "^Categories=" "$app_desktop" 2>/dev/null | cut -d= -f2)
+    fi
+    display_name="${display_name:-$app_name}"
+    categories="${categories:-Development;}"
+
+    local exec_line="env -u APPDIR -u ELECTRON_RUN_AS_NODE -u DESKTOPINTEGRATION ${install_path}/AppRun"
+    if [[ -n "$no_sandbox_flag" ]]; then
+        exec_line="${exec_line} --no-sandbox"
+    fi
+    exec_line="${exec_line} %U"
+
+    {
+        echo "[Desktop Entry]"
+        echo "Name=${display_name}"
+        echo "Exec=${exec_line}"
+        echo "Terminal=false"
+        echo "Type=Application"
+        [[ -n "$icon_path" ]] && echo "Icon=${icon_path}"
+        [[ -n "$wm_class" ]] && echo "StartupWMClass=${wm_class}"
+        [[ -n "$mimetype" ]] && echo "MimeType=${mimetype}"
+        echo "Categories=${categories}"
+        echo "X-AppImage-Version=${latest_version}"
+        echo "X-InstalledBy=appimage-install"
+    } > "$desktop_file"
+
+    # Update bin symlink
+    ln -sf "${install_path}/AppRun" "${BIN_DIR}/${app_name}"
+
+    update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
+
+    echo ""
+    ok "Updated ${display_name}: ${current_version} → ${latest_version}"
+}
+
+do_update_all() {
+    info "Checking all installed apps for updates..."
+    echo ""
+
+    local found=false
+    for desktop_file in "${DESKTOP_DIR}"/*.desktop; do
+        [[ -f "$desktop_file" ]] || continue
+        if grep -q "X-InstalledBy=appimage-install" "$desktop_file" 2>/dev/null; then
+            local app_name
+            app_name=$(basename "$desktop_file" .desktop)
+            local install_path="${INSTALL_DIR}/${app_name}"
+
+            if get_update_info "$install_path" > /dev/null 2>&1; then
+                do_update "$app_name" || warn "Failed to update ${app_name}"
+                echo ""
+                found=true
+            fi
+        fi
+    done
+
+    # Also check manually extracted apps (t3code, opencode)
+    for app_dir in "${INSTALL_DIR}"/*/; do
+        [[ -d "$app_dir" ]] || continue
+        local app_name
+        app_name=$(basename "$app_dir")
+        local desktop_file="${DESKTOP_DIR}/${app_name}.desktop"
+
+        # Skip if already processed above
+        if [[ -f "$desktop_file" ]] && grep -q "X-InstalledBy=appimage-install" "$desktop_file" 2>/dev/null; then
+            continue
+        fi
+
+        if get_update_info "$app_dir" > /dev/null 2>&1; then
+            info "Found updatable app: ${app_name}"
+            do_update "$app_name" || warn "Failed to update ${app_name}"
+            echo ""
+            found=true
+        fi
+    done
+
+    if [[ "$found" == false ]]; then
+        ok "No updatable apps found"
     fi
 }
 
@@ -295,6 +578,17 @@ do_install() {
     fi
     exec_line="${exec_line} %U"
 
+    # Get version for tracking
+    local version=""
+    local app_desktop
+    app_desktop=$(find_desktop_file "$install_path")
+    if [[ -n "$app_desktop" ]]; then
+        version=$(grep "^X-AppImage-Version=" "$app_desktop" 2>/dev/null | cut -d= -f2)
+    fi
+    if [[ -z "$version" ]]; then
+        version=$(get_current_version "$install_path")
+    fi
+
     # Create desktop entry
     mkdir -p "$DESKTOP_DIR"
     local desktop_file="${DESKTOP_DIR}/${app_name}.desktop"
@@ -309,6 +603,7 @@ do_install() {
         [[ -n "$wm_class" ]] && echo "StartupWMClass=${wm_class}"
         [[ -n "$mimetype" ]] && echo "MimeType=${mimetype}"
         echo "Categories=${categories}"
+        [[ -n "$version" && "$version" != "unknown" ]] && echo "X-AppImage-Version=${version}"
         echo "X-InstalledBy=appimage-install"
     } > "$desktop_file"
 
@@ -332,6 +627,7 @@ do_install() {
     echo ""
     echo "  Launch from menu or run: ${app_name}"
     echo "  Install dir: ${install_path}"
+    echo "  Update with: appimage-install --update ${app_name}"
     echo "  Remove with: appimage-install --remove ${app_name}"
 }
 
@@ -340,22 +636,39 @@ do_list() {
     echo ""
 
     local found=false
-    for desktop_file in "${DESKTOP_DIR}"/*.desktop; do
-        [[ -f "$desktop_file" ]] || continue
-        if grep -q "X-InstalledBy=appimage-install" "$desktop_file" 2>/dev/null; then
-            local name dir size
-            name=$(grep "^Name=" "$desktop_file" | cut -d= -f2)
-            app_name=$(basename "$desktop_file" .desktop)
-            dir="${INSTALL_DIR}/${app_name}"
-            size=$(du -sh "$dir" 2>/dev/null | cut -f1 || echo "?")
-            echo -e "  ${GREEN}${app_name}${NC}  ${name}  (${size})"
-            found=true
+
+    for app_dir in "${INSTALL_DIR}"/*/; do
+        [[ -d "$app_dir" ]] || continue
+        local app_name
+        app_name=$(basename "$app_dir")
+        local desktop_file="${DESKTOP_DIR}/${app_name}.desktop"
+        local size
+        size=$(du -sh "$app_dir" 2>/dev/null | cut -f1 || echo "?")
+
+        local display_name="$app_name"
+        local version=""
+        local updatable=""
+
+        if [[ -f "$desktop_file" ]]; then
+            display_name=$(grep "^Name=" "$desktop_file" 2>/dev/null | cut -d= -f2 || true)
+            display_name="${display_name:-$app_name}"
+            version=$(grep "^X-AppImage-Version=" "$desktop_file" 2>/dev/null | cut -d= -f2 || true)
         fi
+
+        if [[ -z "$version" ]]; then
+            version=$(get_current_version "$app_dir")
+        fi
+
+        if get_update_info "$app_dir" > /dev/null 2>&1; then
+            updatable=" [updatable]"
+        fi
+
+        echo -e "  ${GREEN}${app_name}${NC}  ${display_name}  v${version}  (${size})${updatable}"
+        found=true
     done
 
     if [[ "$found" == false ]]; then
-        echo "  No apps installed with appimage-install yet."
-        echo "  (Previously extracted apps won't show here — only new installs.)"
+        echo "  No apps installed yet."
     fi
 }
 
@@ -398,6 +711,12 @@ case "${1:-}" in
         ;;
     --remove|-r)
         do_remove "${2:-}"
+        ;;
+    --update|-u)
+        do_update "${2:-}"
+        ;;
+    --update-all|-U)
+        do_update_all
         ;;
     *)
         do_install "$@"
