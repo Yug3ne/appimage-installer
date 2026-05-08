@@ -46,6 +46,12 @@ appimage-install ~/Downloads/MyApp.AppImage --name myapp
 # List installed apps
 appimage-install --list
 
+#Updated  all updateable appimages
+appimage-install --update-all
+
+#Upadate a specific image
+appimage-install --update appimage
+
 # Remove an app
 appimage-install --remove myapp
 ```
